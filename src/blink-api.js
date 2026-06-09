@@ -19,8 +19,40 @@ const DEFAULT_HOST_PREFIX = 'rest-prod';
 const DEFAULT_URL = `${DEFAULT_HOST_PREFIX}.${BLINK_API_HOST}`;
 const BASE_URL = `https://${DEFAULT_URL}`;
 const OAUTH_BASE_URL = 'https://api.oauth.blink.com';
+const OAUTH_AUTHORIZE_URL = `${OAUTH_BASE_URL}/oauth/v2/authorize`;
+const OAUTH_SIGNIN_URL = `${OAUTH_BASE_URL}/oauth/v2/signin`;
+const OAUTH_2FA_URL = `${OAUTH_BASE_URL}/oauth/v2/2fa/verify`;
+const OAUTH_TOKEN_URL = `${OAUTH_BASE_URL}/oauth/token`;
+const OAUTH_REDIRECT_URI = 'immedia-blink://applinks.blink.com/signin/callback';
+const OAUTH_BROWSER_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.1 Mobile/15E148 Safari/604.1';
+const OAUTH_TOKEN_UA = 'Blink/2511191620 CFNetwork/3860.200.71 Darwin/25.1.0';
 const CACHE = new Map();
 const AUTH_FILE = 'blink-auth.json';
+
+function generatePKCE() {
+    const verifier = crypto.randomBytes(32).toString('base64url');
+    const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+    return { verifier, challenge };
+}
+
+function parseCookies(headers) {
+    const cookies = {};
+    const lines = headers.getSetCookie ? headers.getSetCookie() : [];
+    for (const line of lines) {
+        const eqIdx = line.indexOf('=');
+        const semiIdx = line.indexOf(';');
+        if (eqIdx > 0) {
+            const name = line.slice(0, eqIdx).trim();
+            const value = line.slice(eqIdx + 1, semiIdx > eqIdx ? semiIdx : undefined).trim();
+            cookies[name] = value;
+        }
+    }
+    return cookies;
+}
+
+function cookieHeader(cookies) {
+    return Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join('; ');
+}
 
 const DEFAULT_CLIENT_OPTIONS = {
     notificationKey: null,
@@ -563,146 +595,279 @@ class BlinkAPI {
      *
      **/
 
-    async login(force = false, client = DEFAULT_CLIENT_OPTIONS, httpErrorAsError = true) {
+    async login(force = false, client = DEFAULT_CLIENT_OPTIONS, httpErrorAsError = true, api = null) {
         if (!force && this.token) return;
-        
         if (force) this.token = undefined;
-        
+
         if (!this.auth?.email || !this.auth?.password) throw new Error('Email or Password is blank');
 
         client = Object.assign({}, DEFAULT_CLIENT_OPTIONS, client || {});
         this._clientOptions = client;
-        const data = {
-            username: this.auth.email,
-            client_id: 'android',
-            scope: 'client',
-            hardware_id: this.auth.clientUUID
+
+        const storageBasePath = api?.user?.storagePath?.() ?? api?.user?.customStoragePath ??
+            this.api?.user?.storagePath?.() ?? this.api?.user?.customStoragePath ?? null;
+
+        // Load stored refresh token on first call
+        if (this.refresh_token === undefined && storageBasePath) {
+            const authPath = path.join(storageBasePath, AUTH_FILE);
+            try {
+                const contents = fs.readFileSync(authPath, { encoding: 'utf8' });
+                const authConfig = JSON.parse(contents);
+                if (authConfig?.refresh_token) this.refresh_token = authConfig.refresh_token;
+            }
+            catch (e) { /* no stored token — that's fine */ }
+        }
+
+        // Try refresh token first (no client_secret required for PKCE public client)
+        if (this.refresh_token) {
+            const params = new URLSearchParams({
+                grant_type: 'refresh_token',
+                refresh_token: this.refresh_token,
+                client_id: 'ios',
+                scope: 'client',
+            });
+            try {
+                const refreshRes = await limitedFetch(OAUTH_TOKEN_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': OAUTH_TOKEN_UA },
+                    body: params,
+                });
+                if (refreshRes.ok) {
+                    const tokenData = await refreshRes.json();
+                    if (tokenData.access_token) {
+                        this.refresh_token = tokenData.refresh_token || this.refresh_token;
+                        if (storageBasePath) {
+                            const authPath = path.join(storageBasePath, AUTH_FILE);
+                            try {
+                                fs.writeFileSync(authPath,
+                                    JSON.stringify({ refresh_token: this.refresh_token }), { mode: 0o600 });
+                            }
+                            catch (e) { /* non-fatal */ }
+                        }
+                        return await this._processTokenData(tokenData, storageBasePath, httpErrorAsError);
+                    }
+                }
+            }
+            catch (e) {
+                log.debug('Blink refresh token failed, falling back to PKCE login:', e?.message || e);
+            }
+            // Refresh failed — clear it and try fresh login
+            this.refresh_token = null;
+        }
+
+        // No valid refresh token — attempt OAuth v2 PKCE login
+        const hardwareId = this.auth.clientUUID || DEFAULT_BLINK_CLIENT_UUID;
+        const result = await this.pkceLoginStart(this.auth.email, this.auth.password, hardwareId);
+
+        if (result.requires2FA) {
+            // Store state so complete2FALogin() can finish the flow
+            this._pending2FAState = result.sessionState;
+            // Return a sentinel that blink.js authenticate() can detect
+            return { tsv_state: 'sms', phone: result.phone };
+        }
+
+        return await this._processTokenData(result.tokenData, storageBasePath, httpErrorAsError);
+    }
+
+    async complete2FALogin(otp) {
+        if (!this._pending2FAState) throw new Error('No pending 2FA login — call login() first');
+        const result = await this.pkceLoginComplete2FA(otp, this._pending2FAState);
+        this._pending2FAState = null;
+        return await this._processTokenData(result.tokenData, null, true);
+    }
+
+    async pkceLoginStart(email, password, hardwareId) {
+        hardwareId = hardwareId || this.auth?.clientUUID || DEFAULT_BLINK_CLIENT_UUID;
+        const { verifier, challenge } = generatePKCE();
+        let cookies = {};
+
+        const authorizeParams = {
+            app_brand: 'blink', app_version: '50.1', client_id: 'ios',
+            code_challenge: challenge, code_challenge_method: 'S256',
+            device_brand: 'Apple', device_model: 'iPhone16,1', device_os_version: '26.1',
+            hardware_id: hardwareId,
+            redirect_uri: OAUTH_REDIRECT_URI,
+            response_type: 'code', scope: 'client',
         };
 
-        const storageBasePath = this.api?.user?.storagePath?.() ?? this.api?.user?.customStoragePath ?? null;
+        // Step 1: Authorize — follow redirect manually to collect all cookies
+        let nextUrl = `${OAUTH_AUTHORIZE_URL}?${new URLSearchParams(authorizeParams)}`;
+        for (let hop = 0; hop < 5; hop++) {
+            const r = await limitedFetch(nextUrl, {
+                headers: { 'User-Agent': OAUTH_BROWSER_UA, Cookie: cookieHeader(cookies) },
+                redirect: 'manual',
+            });
+            Object.assign(cookies, parseCookies(r.headers));
+            if (r.status >= 300 && r.status < 400) {
+                const loc = r.headers.get('location') || '';
+                nextUrl = loc.startsWith('http') ? loc : `${OAUTH_BASE_URL}${loc}`;
+            }
+            else break;
+        }
 
-        // Restore the refresh token from the saved file
+        // Step 2: Get CSRF token
+        const signinPageRes = await limitedFetch(OAUTH_SIGNIN_URL, {
+            headers: { 'User-Agent': OAUTH_BROWSER_UA, Cookie: cookieHeader(cookies) },
+        });
+        Object.assign(cookies, parseCookies(signinPageRes.headers));
+        const html = await signinPageRes.text();
+        const csrfMatch = html.match(/<script[^>]+id="oauth-args"[^>]*>([\s\S]*?)<\/script>/);
+        if (!csrfMatch) throw new Error('Blink: failed to load OAuth signin page');
+        const oauthArgs = JSON.parse(csrfMatch[1]);
+        const csrfToken = oauthArgs['csrf-token'];
+        if (!csrfToken) throw new Error('Blink: no CSRF token on signin page');
 
-        if (this.refresh_token === undefined && storageBasePath)
-        {
+        // Step 3: Sign in
+        const signinRes = await limitedFetch(OAUTH_SIGNIN_URL, {
+            method: 'POST',
+            headers: {
+                'User-Agent': OAUTH_BROWSER_UA,
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Origin': OAUTH_BASE_URL,
+                'Referer': OAUTH_SIGNIN_URL,
+                Cookie: cookieHeader(cookies),
+            },
+            body: new URLSearchParams({ username: email, password, 'csrf-token': csrfToken }),
+            redirect: 'manual',
+        });
+        Object.assign(cookies, parseCookies(signinRes.headers));
+
+        if (signinRes.status === 202) {
+            const twoFAData = await signinRes.json();
+            return {
+                requires2FA: true,
+                phone: twoFAData.phone,
+                sessionState: { verifier, authorizeParams, csrfToken, cookies },
+            };
+        }
+
+        if (signinRes.status >= 300 && signinRes.status < 400) {
+            const tokenData = await this._pkceGetTokens(verifier, authorizeParams, cookies);
+            return { requires2FA: false, tokenData };
+        }
+
+        const errBody = await signinRes.json().catch(() => ({}));
+        throw new Error(`Blink sign-in failed (${signinRes.status}): ${errBody.error_description || 'bad credentials'}`);
+    }
+
+    async pkceLoginComplete2FA(otp, sessionState) {
+        const { verifier, authorizeParams, csrfToken, cookies: savedCookies } = sessionState;
+        let cookies = { ...savedCookies };
+
+        // Verify the OTP
+        const verifyRes = await limitedFetch(OAUTH_2FA_URL, {
+            method: 'POST',
+            headers: {
+                'User-Agent': OAUTH_BROWSER_UA,
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Origin': OAUTH_BASE_URL,
+                'Referer': OAUTH_SIGNIN_URL,
+                Cookie: cookieHeader(cookies),
+            },
+            body: new URLSearchParams({ '2fa_code': otp, 'csrf-token': csrfToken, remember_me: 'false' }),
+        });
+        Object.assign(cookies, parseCookies(verifyRes.headers));
+
+        if (!verifyRes.ok) {
+            const err = await verifyRes.json().catch(() => ({}));
+            throw new Error(`Blink 2FA verification failed (${verifyRes.status}): ${err.error_description || 'invalid code'}`);
+        }
+
+        const tokenData = await this._pkceGetTokens(verifier, authorizeParams, cookies);
+        return { tokenData };
+    }
+
+    async _pkceGetTokens(verifier, authorizeParams, cookies) {
+        // Get authorization code — plain GET, session cookies carry the auth state
+        const codeRes = await limitedFetch(OAUTH_AUTHORIZE_URL, {
+            headers: {
+                'User-Agent': OAUTH_BROWSER_UA,
+                'Referer': OAUTH_SIGNIN_URL,
+                Cookie: cookieHeader(cookies),
+            },
+            redirect: 'manual',
+        });
+
+        const location = codeRes.headers.get('location') || '';
+        let code;
+        try { code = new URL(location).searchParams.get('code'); }
+        catch (e) { /* invalid URL */ }
+        if (!code) throw new Error('Blink: authorization code not found in redirect: ' + location);
+
+        // Exchange code for tokens
+        const tokenRes = await limitedFetch(OAUTH_TOKEN_URL, {
+            method: 'POST',
+            headers: { 'User-Agent': OAUTH_TOKEN_UA, 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                grant_type: 'authorization_code',
+                app_brand: 'blink',
+                client_id: 'ios',
+                code,
+                code_verifier: verifier,
+                hardware_id: authorizeParams.hardware_id,
+                redirect_uri: OAUTH_REDIRECT_URI,
+                scope: 'client',
+            }),
+        });
+
+        const tokenData = await tokenRes.json();
+        if (!tokenData.access_token) {
+            throw new Error('Blink: token exchange failed: ' + (tokenData.error_description || tokenData.error || tokenRes.status));
+        }
+        return tokenData;
+    }
+
+    async _processTokenData(tokenData, storageBasePath, httpErrorAsError) {
+        this.token = tokenData.access_token;
+        this.refresh_token = tokenData.refresh_token || this.refresh_token;
+
+        if (tokenData.refresh_token && storageBasePath) {
             const authPath = path.join(storageBasePath, AUTH_FILE);
-            let contents;
+            try {
+                fs.writeFileSync(authPath, JSON.stringify({ refresh_token: tokenData.refresh_token }), { mode: 0o600 });
+            }
+            catch (e) { /* non-fatal */ }
+        }
 
-            try { contents = fs.readFileSync(authPath, {encoding: 'utf8'}) } catch (e){ console.log('readFileSync', e); };
+        if (this.accountID === undefined) {
+            const tier = await this.get('/api/v1/users/tier_info', 1, false, httpErrorAsError ?? true);
+            this.init(tokenData.access_token, tier.account_id, tokenData.account?.client_id, tier.tier);
+        }
 
-            if (typeof contents === 'string')
-            {
-                let authConfig;
-
-                try { authConfig = JSON.parse(contents); } catch(e){ console.log('JSON.parse', e); }
-
-                if (typeof authConfig === 'object')
-                {
-                    this.refresh_token = authConfig.refresh_token;
-                }
+        if (!this.region || this.region === 'prod') {
+            try {
+                const ti = await this.get('/api/v1/account/tier_info', 0, false, false);
+                const discovered = ti?.tier || ti?.region || ti?.account?.tier;
+                if (discovered && discovered !== this.region) this.region = discovered;
+            }
+            catch (e) {
+                log.debug('tier_info lookup failed:', e?.message || e);
             }
         }
 
-        // Use the refresh token to request a new one, or the password and 2FA if we don't have one
+        const expiresIn = Number(tokenData.expires_in ?? 0);
+        const expiresAt = tokenData.expires_at != null
+            ? Number(tokenData.expires_at)
+            : (expiresIn > 0 ? Date.now() + expiresIn * 1000 : null);
+        const hardwareId = this.auth?.clientUUID || DEFAULT_BLINK_CLIENT_UUID;
 
-        if (this.refresh_token)
-        {
-            data['grant_type']    = 'refresh_token';
-            data['refresh_token'] = this.refresh_token;
-        }
-        else
-        {
-            data['grant_type'] = 'password';
-            data['password']   = this.auth.password;
-        }
-
-        const response = await this.post('https://api.oauth.blink.com/oauth/token', data, false, httpErrorAsError,
-            { includeHeaders: true });
-        const res = response?.body ?? response;
-        const responseHeaders = response?.headers ?? null;
-        if (/unauthorized|invalid/i.test(res?.message)) {
-            throw new Error(res.message);
-        }
-        else {
-            // Set the access token so that future calls will use it
-
-            this.token = res.access_token;
-            this.refresh_token = res.refresh_token
-
-            if (res.refresh_token && storageBasePath)
-            {
-                const authPath = path.join(storageBasePath, AUTH_FILE);
-                const authConfig = JSON.stringify({refresh_token: res.refresh_token});  // Only save the refresh token.
-
-                try { fs.writeFileSync(authPath, authConfig, {mode: 0o600}); } catch(e) { console.log('fsWriteFileSync', e); }
-            }
-
-            // get the account_id for future calls
-
-            if (this.accountID === undefined)
-            {
-                const tier = await this.get('/api/v1/users/tier_info', 1, false, httpErrorAsError);
-
-                this.init(res.access_token, tier.account_id, res.account?.client_id, tier.tier);
-            }
-            
-            // Resolve the real shard (u003/prde/etc.) from tier_info if region is not yet known or is prod.
-            if (!this.region || this.region === 'prod') {
-                try {
-                    const ti = await this.get('/api/v1/account/tier_info', 0, /*autologin*/ false, /*httpErrorAsError*/ false);
-                    const discovered = ti?.tier || ti?.region || ti?.account?.tier;
-                    if (discovered && discovered !== this.region) this.region = discovered;
-                } catch (e) {
-                    // Optional probe; keep quiet unless debugging
-                    log.debug('tier_info lookup failed; staying on region:', this.region, e?.message || e);
-                }
-            }
-        }
-        const normalizedHeaders = responseHeaders
-            ? Object.fromEntries(Object.entries(responseHeaders).map(([key, value]) => [key.toLowerCase(), value]))
-            : null;
-        const scope = res.scope || data.scope || client.oauthScope;
-        const tokenType = res.token_type || normalizedHeaders?.['token-type'] || normalizedHeaders?.['token_type'] || 'Bearer';
-        const hardwareId = this.auth?.hardwareId || this.auth?.clientUUID || client.hardwareId || DEFAULT_BLINK_CLIENT_UUID;
-        const accountId = res.account?.account_id ?? res.account_id ?? this.accountID ?? null;
-        const clientId = res.account?.client_id ?? res.client_id ?? this.clientID ?? null;
-        const region = res.account?.tier ?? res.region ?? this.region ?? null;
-        const sessionId = res.session_id ?? normalizedHeaders?.['session-id'] ?? normalizedHeaders?.['session_id'] ?? null;
-        const expiresInHeader = normalizedHeaders?.['expires-in'] ?? normalizedHeaders?.['x-expires-in'];
-        const expiresIn = Number(res?.expires_in ?? expiresInHeader ?? 0);
-        const expiresAt = res?.expires_at !== undefined && res?.expires_at !== null
-            ? Number(res.expires_at)
-            : (Number.isFinite(expiresIn) && expiresIn > 0 ? Date.now() + expiresIn * 1000 : null);
-
-        this._oauthHeaders = normalizedHeaders ? { ...normalizedHeaders } : null;
         this._oauthBundle = {
             access_token: this.token,
             refresh_token: this.refresh_token,
-            token_type: tokenType,
-            scope,
+            token_type: tokenData.token_type || 'Bearer',
+            scope: tokenData.scope || 'client',
             expires_at: expiresAt ?? null,
-            expires_in: Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : null,
-            account_id: accountId,
-            client_id: clientId,
-            region,
+            expires_in: expiresIn > 0 ? expiresIn : null,
+            account_id: tokenData.account?.account_id ?? tokenData.account_id ?? this.accountID ?? null,
+            client_id: tokenData.account?.client_id ?? tokenData.client_id ?? this.clientID ?? null,
+            region: tokenData.account?.tier ?? tokenData.region ?? this.region ?? null,
             hardware_id: hardwareId,
-            session_id: sessionId,
-            user_id: res.account?.user_id ?? res.user_id ?? null,
-            headers: this._oauthHeaders ? { ...this._oauthHeaders } : null,
+            user_id: tokenData.account?.user_id ?? tokenData.user_id ?? null,
+            headers: null,
         };
 
-        if (normalizedHeaders) {
-            res.headers = { ...normalizedHeaders };
-            res.token_headers = { ...normalizedHeaders };
-        }
-        if (expiresAt) {
-            res.expires_at = expiresAt;
-        }
-        if (Number.isFinite(expiresIn) && expiresIn > 0) {
-            res.expires_in = expiresIn;
-        }
-
-        return res;
+        if (expiresAt) tokenData.expires_at = expiresAt;
+        return tokenData;
     }
 
     getOAuthBundle() {

@@ -4,6 +4,9 @@ const { log: sharedLog } = require('../src/log');
 const BlinkAPI = require('../src/blink-api');
 const { randomUUID } = require('crypto');
 
+// In-memory store for pending 2FA sessions (keyed by sessionId, auto-expires after 10 min)
+const PENDING_2FA = new Map();
+
 const REFRESH_ENDPOINT = 'https://api.oauth.blink.com/oauth/token';
 const DEFAULT_SCOPE = 'client offline_access';
 const DEFAULT_CLIENT_ID = 'ios';
@@ -139,6 +142,16 @@ class PluginUiServer extends HomebridgePluginUiServer {
             }
         });
 
+        this.onRequest('/tokens/verify-2fa', async payload => {
+            try {
+                this.log.info('/tokens/verify-2fa requested');
+                return await this.handleVerify2FARequest(payload);
+            } catch (err) {
+                this.log.error('/tokens/verify-2fa error:', err);
+                throw err;
+            }
+        });
+
         this.ready();
     }
 
@@ -180,36 +193,15 @@ class PluginUiServer extends HomebridgePluginUiServer {
         const requestedClientId = normalizeString(payload.clientId || payload.client_id);
         const requestedClientSecret = normalizeString(payload.clientSecret || payload.client_secret);
 
-        const attempts = [];
-        const addAttempt = (clientId, clientSecret, label) => {
-            if (!clientId) return;
-            const key = `${clientId}::${clientSecret || ''}`;
-            if (attempts.some(entry => entry.key === key)) return;
-            attempts.push({ clientId, clientSecret, label, key });
-        };
-
-        const resolveSecret = (clientId, secret) => {
-            if (secret) return secret;
-            if (clientId === DEFAULT_CLIENT_ID) return DEFAULT_CLIENT_SECRET;
-            return secret || null;
-        };
-
-        if (requestedClientId) {
-            addAttempt(requestedClientId, resolveSecret(requestedClientId, requestedClientSecret), 'requested-client');
-        } else {
-            addAttempt(DEFAULT_CLIENT_ID, DEFAULT_CLIENT_SECRET, 'default-client');
-        }
+        // PKCE-issued tokens must be refreshed without a client_secret (public client)
+        const clientId = requestedClientId || DEFAULT_CLIENT_ID;
 
         let lastError = null;
-        for (const attempt of attempts) {
+        {
             const params = new URLSearchParams();
             params.append('grant_type', 'refresh_token');
             params.append('refresh_token', refreshToken);
-            params.append('client_id', attempt.clientId);
-            const effectiveSecret = resolveSecret(attempt.clientId, attempt.clientSecret);
-            if (effectiveSecret) {
-                params.append('client_secret', effectiveSecret);
-            }
+            params.append('client_id', clientId);
             if (scope || DEFAULT_SCOPE) {
                 params.append('scope', scope || DEFAULT_SCOPE);
             }
@@ -230,39 +222,32 @@ class PluginUiServer extends HomebridgePluginUiServer {
             if (!response.ok) {
                 const reason = rawBody?.error_description || rawBody?.error || response.statusText;
                 lastError = new Error(reason || 'Blink token refresh failed.');
-                this.log.debug(
-                    `Blink token refresh attempt ${attempt.label || attempt.clientId} failed: ${lastError.message}`
-                );
-                continue;
+                this.log.debug(`Blink token refresh failed: ${lastError.message}`);
             }
+            else {
+                const headers = collectHeaders(response);
+                const expiresIn = Number(rawBody?.expires_in || headers['expires-in'] || 0);
+                const expiresAt = rawBody?.expires_at
+                    ? Number(rawBody.expires_at)
+                    : (expiresIn > 0 ? Date.now() + expiresIn * 1000 : null);
 
-            const headers = collectHeaders(response);
-            const expiresIn = Number(rawBody?.expires_in || headers['expires-in'] || 0);
-            const expiresAt = rawBody?.expires_at
-                ? Number(rawBody.expires_at)
-                : (expiresIn > 0 ? Date.now() + expiresIn * 1000 : null);
+                const tokens = mergeHeaderFields({
+                    access_token: rawBody?.access_token || null,
+                    refresh_token: rawBody?.refresh_token || refreshToken || null,
+                    expires_at: expiresAt,
+                    account_id: toNumber(rawBody?.account_id),
+                    client_id: toNumber(rawBody?.client_id),
+                    region: rawBody?.region || null,
+                    scope: rawBody?.scope || scope,
+                    token_type: rawBody?.token_type || headers['token-type'] || 'Bearer',
+                    session_id: rawBody?.session_id || headers['session-id'] || null,
+                    hardware_id: rawBody?.hardware_id || hardwareId || headers['hardware-id'] || null,
+                }, headers);
 
-            const tokens = mergeHeaderFields({
-                access_token: rawBody?.access_token || null,
-                refresh_token: rawBody?.refresh_token || refreshToken || null,
-                expires_at: expiresAt,
-                account_id: toNumber(rawBody?.account_id),
-                client_id: toNumber(rawBody?.client_id),
-                region: rawBody?.region || null,
-                scope: rawBody?.scope || scope,
-                token_type: rawBody?.token_type || headers['token-type'] || 'Bearer',
-                session_id: rawBody?.session_id || headers['session-id'] || null,
-                hardware_id: rawBody?.hardware_id || hardwareId || headers['hardware-id'] || null,
-            }, headers);
+                tokens.oauth_client_id = clientId;
 
-            tokens.oauth_client_id = attempt.clientId;
-
-            return {
-                status: 'ok',
-                tokens,
-                headers,
-                raw: rawBody,
-            };
+                return { status: 'ok', tokens, headers, raw: rawBody };
+            }
         }
 
         throw lastError || new Error('Blink token refresh failed.');
@@ -275,69 +260,64 @@ class PluginUiServer extends HomebridgePluginUiServer {
             throw new Error('Blink username and password are required to request new tokens.');
         }
 
-        const pin = normalizeString(payload.pin);
-        const otp = normalizeString(payload.otp || payload.twoFactorCode || payload.twoFactorToken);
-        let hardwareId = normalizeString(payload.hardwareId || payload.hardware_id);
-        const refreshToken = normalizeString(payload.refreshToken || payload.refresh_token);
-        const accessToken = normalizeString(payload.accessToken || payload.access_token);
-        const tokenExpiresAt = payload.tokenExpiresAt ?? payload.expires_at ?? null;
+        const hardwareId = normalizeString(payload.hardwareId || payload.hardware_id) ||
+            randomUUID().toUpperCase();
+        const api = new BlinkAPI(hardwareId, { clientUUID: hardwareId, email: username, password });
 
-        const clientUUID = hardwareId || normalizeString(payload.clientUUID) || randomUUID().toUpperCase();
-        if (!hardwareId) hardwareId = clientUUID;
-
-        const authOverrides = {
-            clientUUID,
-            hardwareId,
-            email: username,
-            password,
-        };
-        if (pin) authOverrides.pin = pin;
-        if (otp) authOverrides.otp = otp;
-        if (refreshToken) authOverrides.refreshToken = refreshToken;
-        if (accessToken) authOverrides.accessToken = accessToken;
-        if (tokenExpiresAt) authOverrides.expires_at = tokenExpiresAt;
-
-        const api = new BlinkAPI(clientUUID, authOverrides);
-        let session;
+        let result;
         try {
-            session = await api.login(true, null, false);
-        } catch (err) {
-            throw new Error(err?.message || 'Blink authentication failed. Check credentials and 2FA inputs.');
+            result = await api.pkceLoginStart(username, password, hardwareId);
+        }
+        catch (err) {
+            throw new Error(err?.message || 'Blink authentication failed. Check your credentials.');
         }
 
-        const bundle = api.getOAuthBundle();
-        const requiresTwoFactor = session?.tsv_state
-            || session?.account?.client_verification_required
-            || session?.account?.verification_required
-            || session?.account?.phone_verification_required
-            || session?.verification?.phone?.required
-            || session?.verification?.email?.required;
+        if (result.requires2FA) {
+            const sessionId = randomUUID();
+            PENDING_2FA.set(sessionId, { api, sessionState: result.sessionState, hardwareId });
+            setTimeout(() => PENDING_2FA.delete(sessionId), 10 * 60 * 1000);
 
-        if (requiresTwoFactor && (!bundle || !bundle.access_token)) {
-            const phoneHint = session?.phone?.number
-                || (session?.phone?.last_4_digits ? `•••• ${session.phone.last_4_digits}` : null);
-            const message = phoneHint
-                ? `Two-factor verification required. Check ${phoneHint} for the PIN.`
-                : 'Two-factor verification required. Check your phone for the PIN.';
             return {
                 status: '2fa-required',
-                message,
-                headers: session?.headers || session?.token_headers || null,
-                raw: session,
+                sessionId,
+                message: `Blink sent a verification code via SMS to ${result.phone || 'your phone'}.`,
             };
         }
 
-        if (!bundle || !bundle.access_token) {
-            throw new Error('Blink did not return a valid access token. Verify your credentials and 2FA information.');
+        return this._buildTokenResponse(api, result.tokenData);
+    }
+
+    async handleVerify2FARequest(payload = {}) {
+        const sessionId = normalizeString(payload.sessionId);
+        const otp = normalizeString(payload.otp || payload.code || payload.pin);
+
+        if (!sessionId) throw new Error('sessionId is required');
+        if (!otp) throw new Error('Verification code is required');
+
+        const pending = PENDING_2FA.get(sessionId);
+        if (!pending) throw new Error('Session expired or not found. Please start the login again.');
+
+        let result;
+        try {
+            result = await pending.api.pkceLoginComplete2FA(otp, pending.sessionState);
+        }
+        catch (err) {
+            throw new Error(err?.message || 'Blink 2FA verification failed. Check the code and try again.');
         }
 
-        const responseHeaders = session?.headers || session?.token_headers || bundle.headers || null;
+        PENDING_2FA.delete(sessionId);
+        return this._buildTokenResponse(pending.api, result.tokenData);
+    }
 
+    _buildTokenResponse(api, tokenData) {
+        const bundle = api.getOAuthBundle();
+        if (!bundle?.access_token) {
+            throw new Error('Blink did not return a valid access token.');
+        }
         return {
             status: 'ok',
-            tokens: mergeHeaderFields({ ...bundle }, responseHeaders || {}),
-            headers: responseHeaders,
-            raw: session,
+            tokens: mergeHeaderFields({ ...bundle }, {}),
+            raw: tokenData,
         };
     }
 }
