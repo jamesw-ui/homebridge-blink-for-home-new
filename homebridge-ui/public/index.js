@@ -19,6 +19,7 @@
         config: {},
         busy: false,
         awaitingPin: false,
+        pending2FASessionId: null,
     };
     const DEFAULT_NAME = 'Blink';
 
@@ -385,6 +386,7 @@
             if (response?.status === '2fa-required') {
                 const infoMessage = response?.message
                     || 'Two-factor verification required. Check your phone for the 6-digit PIN and enter it below.';
+                state.pending2FASessionId = response.sessionId || null;
                 await persistConfig({
                     username: form.username,
                     password: form.password,
@@ -421,6 +423,42 @@
             } else {
                 toast.error(message || 'Blink login failed. Verify your credentials and 2FA inputs.');
             }
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    async function verify2FA(otp) {
+        if (state.busy) return;
+        if (!state.pending2FASessionId) {
+            toast.error('Session expired. Please click Login & Fetch Tokens again.');
+            togglePinPrompt(false);
+            return;
+        }
+        setBusy(true);
+        try {
+            const form = getAuthFormValues();
+            const response = await ui.request('/tokens/verify-2fa', {
+                sessionId: state.pending2FASessionId,
+                otp,
+            });
+            const tokens = response?.tokens || {};
+            await persistConfig({
+                ...normalizePersistPayload(tokens, {
+                    hardwareId: form.hardwareId || state.config.hardwareId,
+                }),
+                username: form.username || state.config.username || '',
+                password: form.password || state.config.password || '',
+                pin: '',
+            });
+            state.pending2FASessionId = null;
+            state.awaitingPin = false;
+            togglePinPrompt(false);
+            syncFormFromConfig();
+            toast.success('Blink login successful. Tokens updated.');
+        } catch (err) {
+            console.error('Blink 2FA verification failed', err);
+            toast.error(err?.message || 'Verification failed. Check the code and try again.');
         } finally {
             setBusy(false);
         }
@@ -554,7 +592,7 @@
             const pinValue = pinInput.value.trim();
             if (!state.awaitingPin || state.busy) return;
             if (/^\d{6}$/.test(pinValue)) {
-                loginWithCredentials({ autoSubmit: true });
+                verify2FA(pinValue);
             }
         });
     }
