@@ -264,6 +264,7 @@ class PluginUiServer extends HomebridgePluginUiServer {
             randomUUID().toUpperCase();
         const api = new BlinkAPI(hardwareId, { clientUUID: hardwareId, email: username, password });
 
+        this.log.info('Starting OAuth v2 PKCE login for', username);
         let result;
         try {
             result = await api.pkceLoginStart(username, password, hardwareId);
