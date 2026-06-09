@@ -65,6 +65,7 @@
     const loginButton = document.getElementById('login-credentials');
     const clearCredentialsButton = document.getElementById('clear-credentials');
     const saveSettingsButton = document.getElementById('save-settings');
+    const submitPinButton = document.getElementById('submit-pin');
     const defaultPinMessage = pinHelp?.textContent || 'Enter the 6-digit PIN Blink sends to you.';
     const detailsToggle = document.getElementById('details-toggle');
     const detailsBody = document.getElementById('details-body');
@@ -225,6 +226,7 @@
         loginButton.disabled = isBusy;
         clearCredentialsButton.disabled = isBusy;
         if (saveSettingsButton) saveSettingsButton.disabled = isBusy;
+        if (submitPinButton) submitPinButton.disabled = isBusy;
     }
 
     async function loadConfig() {
@@ -594,6 +596,16 @@
             if (/^\d{6}$/.test(pinValue)) {
                 verify2FA(pinValue);
             }
+        });
+    }
+    if (submitPinButton) {
+        submitPinButton.addEventListener('click', () => {
+            const pinValue = pinInput?.value?.trim() || '';
+            if (!pinValue) {
+                toast.error('Enter the 6-digit PIN before submitting.');
+                return;
+            }
+            verify2FA(pinValue);
         });
     }
 
